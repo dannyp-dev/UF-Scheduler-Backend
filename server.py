@@ -7,22 +7,34 @@ import re
 import networkx as nx
 import gc
 import os
+import hashlib
+from pathlib import Path
 
 app = Flask(__name__)
-CORS(app, origins=[
-    'http://ufscheduler.com',
-    'https://ufscheduler.com',
-    'http://www.ufscheduler.com',
-    'https://www.ufscheduler.com',
-    'http://localhost:3000'
-])
+allowed_origins = [origin.strip() for origin in os.environ.get(
+    'SCHEDULER_ALLOWED_ORIGINS', 'http://localhost:3000'
+).split(',') if origin.strip()]
+CORS(app, origins=allowed_origins)
 
 # -------------------------------------------------------------------
 # 1. Locate and load all course JSON files corresponding to (_{year}_{term}_final.json)
 #    Create a dictionary of code->course for each (year, term).
 # -------------------------------------------------------------------
 
-json_files = glob.glob('courses/*_final.json')
+ROOT = Path(__file__).resolve().parent
+
+def available_course_files():
+    """Use one data file per term, preferring an authorized imported export."""
+    selected = {}
+    for filename in (ROOT / 'courses').glob('*_final.json'):
+        year, term = parse_year_term_from_filename(filename)
+        key = (year, term)
+        priority = (filename.name.startswith('UF_Imported_'), filename.stat().st_mtime)
+        if key not in selected or priority > selected[key][0]:
+            selected[key] = (priority, filename)
+    return [item[1] for item in selected.values()]
+
+json_files = []
 course_data_map = {}  # Dictionary keyed by (year, term) -> {code -> course}
 course_dept_map = {}  # Dictionary keyed by (year, term) -> {code -> deptName}
 
@@ -53,7 +65,7 @@ def get_connection(db_name):
     """
     Returns a connection to the given SQLite database.
     """
-    return sqlite3.connect(db_name)
+    return sqlite3.connect(ROOT / db_name)
 
 def init_db_for_file(json_path):
     """
@@ -72,6 +84,13 @@ def init_db_for_file(json_path):
     conn = get_connection(db_name)
     cur = conn.cursor()
     cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute('CREATE TABLE IF NOT EXISTS course_meta (source_hash TEXT NOT NULL)')
+    source_hash = hashlib.sha256(Path(json_path).read_bytes()).hexdigest()
+    previous_hash = cur.execute('SELECT source_hash FROM course_meta LIMIT 1').fetchone()
+    if previous_hash is None or previous_hash[0] != source_hash:
+        cur.execute('DROP TABLE IF EXISTS courses_fts')
+        cur.execute('DELETE FROM course_meta')
+        cur.execute('INSERT INTO course_meta (source_hash) VALUES (?)', (source_hash,))
 
     cur.execute('''
         CREATE VIRTUAL TABLE IF NOT EXISTS courses_fts
@@ -122,9 +141,23 @@ def init_db_for_file(json_path):
     course_data_map[(year, term)] = local_course_map
     course_dept_map[(year, term)] = local_dept_map
 
-# Initialize a DB for each final JSON on startup
+# Initialize a DB for each available term on startup
+json_files = available_course_files()
 for jpath in json_files:
     init_db_for_file(jpath)
+
+@app.route('/api/terms', methods=['GET'])
+def get_terms():
+    return jsonify([
+        {'year': year, 'term': term,
+         'courses': len(courses),
+         'sectionsWithMeetingTimes': sum(
+             bool(section.get('meetTimes'))
+             for course in courses.values()
+             for section in course.get('sections', [])
+         )}
+        for (year, term), courses in sorted(course_data_map.items())
+    ])
 
 # -------------------------------------------------------------------
 # 3. Modify the /api/get_courses route to accept year and term,
@@ -141,7 +174,7 @@ def get_courses():
       - term:  'fall', 'summer', 'spring', etc.
     Returns a JSON list of matched courses, from the correct DB.
     """
-    data = request.json
+    data = request.get_json(silent=True) or {}
     searchTerm = data.get('searchTerm', '').strip()
     itemsPerPage = data.get('itemsPerPage', 20)
     startFrom = data.get('startFrom', 0)
@@ -152,6 +185,15 @@ def get_courses():
     if not year or not term:
         return jsonify({"error": "Missing 'year' or 'term' in request body"}), 400
 
+    if (year, term) not in course_data_map:
+        return jsonify({"error": "No course data for the requested term"}), 404
+
+    try:
+        itemsPerPage = max(1, min(100, int(itemsPerPage)))
+        startFrom = max(0, int(startFrom))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid pagination values"}), 400
+
     db_name = f'courses_{year}_{term}.db'
     # Look up the relevant code->course dictionary
     codes_dict = course_data_map.get((year, term), {})
@@ -160,7 +202,7 @@ def get_courses():
         return jsonify([])
 
     terms = searchTerm.split()
-    prefix_terms = [term + '*' for term in terms]
+    prefix_terms = ['"' + term.replace('"', '""') + '"*' for term in terms]
     fts_query = ' '.join(prefix_terms)
 
     conn = get_connection(db_name)
