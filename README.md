@@ -22,6 +22,8 @@ The old scheduled GitHub Actions scraper has been removed because the public fee
 
 Install `requirements.txt`, then run `python server.py` from the repository root. `GET /api/terms` lists the terms loaded at startup and the number of sections with meeting times. `POST /api/get_courses` accepts `searchTerm`, `year`, `term`, `itemsPerPage`, and `startFrom`. The prerequisite graph endpoint remains `POST /generate_a_list`.
 
+For a separately hosted frontend, set `SCHEDULER_ALLOWED_ORIGINS` to its exact HTTPS origin. Separate multiple origins with commas. The default allows `http://localhost:3000` for local development. If a reverse proxy serves the frontend and API on the same origin, browser CORS permission is not needed.
+
 Run the import checks with:
 
 ```bash

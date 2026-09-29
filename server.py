@@ -11,13 +11,10 @@ import hashlib
 from pathlib import Path
 
 app = Flask(__name__)
-CORS(app, origins=[
-    'http://ufscheduler.com',
-    'https://ufscheduler.com',
-    'http://www.ufscheduler.com',
-    'https://www.ufscheduler.com',
-    'http://localhost:3000'
-])
+allowed_origins = [origin.strip() for origin in os.environ.get(
+    'SCHEDULER_ALLOWED_ORIGINS', 'http://localhost:3000'
+).split(',') if origin.strip()]
+CORS(app, origins=allowed_origins)
 
 # -------------------------------------------------------------------
 # 1. Locate and load all course JSON files corresponding to (_{year}_{term}_final.json)
